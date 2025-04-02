@@ -62,7 +62,7 @@ def pibooth_startup(app, cfg):
         app.google_photos = GooglePhotosApi(client_id_file, cfg.join_path(CACHE_FILE))
 
 
-@pibooth.hookimpl
+@pibooth.hookimpl (tryfirst=True)
 def state_processing_exit(app, cfg):
     """Upload picture to google photo album"""
     if hasattr(app, 'google_photos'):
