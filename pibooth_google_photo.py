@@ -33,6 +33,12 @@ def pibooth_configure(cfg):
                    "Album name", "Pibooth")
     cfg.add_option(SECTION, 'client_id_file', '',
                    "Credentials file downloaded from Google API")
+    cfg.add_option(SECTION, 'reduce_url_activated', False,
+                   "Activate or deactivate URL reduction",
+                   "Reduce URL Activated", False)
+    cfg.add_option(SECTION, 'reduce_url', 'https://is.gd/create.php?format=json&url={url}',
+                   "Service URL for reducing links",
+                   "Reduce URL", 'https://is.gd/create.php?format=json&url={url}')
 
 
 @pibooth.hookimpl
@@ -62,15 +68,38 @@ def pibooth_startup(app, cfg):
         app.google_photos = GooglePhotosApi(client_id_file, cfg.join_path(CACHE_FILE))
 
 
-@pibooth.hookimpl (tryfirst=True)
+@pibooth.hookimpl(tryfirst=True)
 def state_processing_exit(app, cfg):
-    """Upload picture to google photo album"""
+    """Upload picture to google photo album and shorten URL if needed"""
     if hasattr(app, 'google_photos'):
         photo_id = app.google_photos.upload(app.previous_picture_file,
                                             cfg.get(SECTION, 'album_name'))
 
         if photo_id is not None:
             app.previous_picture_url = app.google_photos.get_temp_url(photo_id)
+            
+            # Ajout de la logique de réduction d'URL
+            if cfg.getboolean(SECTION, 'reduce_url_activated'):
+                reduce_service = cfg.get(SECTION, 'reduce_url', fallback='').strip()
+                if reduce_service:
+                    try:
+                        url = app.previous_picture_url
+                        api_url = reduce_service.format(url=url)  # Modification clé ici
+                        response = requests.get(api_url)
+
+                        if response.status_code == 200:
+                            shortened_url = response.json().get("shorturl")
+                            if shortened_url:
+                                app.previous_picture_url = shortened_url
+                                LOGGER.debug(f"URL reduced: {shortened_url}")
+                            else:
+                                LOGGER.error("Invalid response from URL shortener")
+                        else:
+                            LOGGER.error(f"URL shortening error (HTTP {response.status_code}): {response.text}")
+                    except Exception as e:
+                        LOGGER.error(f"URL shortening failed: {str(e)}")
+                else:
+                    LOGGER.error("URL reduction activated but no service URL configured")
         else:
             app.previous_picture_url = None
 
