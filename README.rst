@@ -32,6 +32,13 @@ Here below the new configuration options available in the `pibooth`_ configurati
 
     # Credentials file downloaded from Google API
     client_id_file =
+    
+    #Activate or deactivate URL reduction
+    reduce_url_activated = False
+    
+    #Service URL for reducing links
+    reduce_url = https://is.gd/create.php?format=json&url={url}
+
 
 .. note:: Edit the configuration by running the command ``pibooth --config``.
 
