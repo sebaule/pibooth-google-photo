@@ -72,9 +72,23 @@ def pibooth_startup(app, cfg):
 def state_processing_exit(app, cfg):
     """Upload picture to google photo album and shorten URL if needed"""
     if hasattr(app, 'google_photos'):
-        photo_id = app.google_photos.upload(app.previous_picture_file,
+        # Déterminer quel fichier uploader
+        file_to_upload = app.previous_picture_file
+        
+        # Si on est en mode vidéo et qu'un GIF a été créé, utiliser le GIF
+        if hasattr(app, 'selected_mode') and app.selected_mode == 'video' and hasattr(app, 'gif_path') and os.path.exists(app.gif_path):
+            file_to_upload = app.gif_path
+            LOGGER.info(f"Mode vidéo détecté, utilisation du GIF pour l'upload: {app.gif_path}")
+        else:
+            LOGGER.info(f"Mode photo ou pas de GIF, utilisation de l'image: {app.previous_picture_file}")
+        
+        photo_id = app.google_photos.upload(file_to_upload,
                                             cfg.get(SECTION, 'album_name'))
 
+        if not photo_id:
+            LOGGER.error("Échec critique de l'upload, annulation du processus")
+            app.previous_picture_url = None
+            return
         if photo_id is not None:
             app.previous_picture_url = app.google_photos.get_temp_url(photo_id)
             
@@ -84,7 +98,11 @@ def state_processing_exit(app, cfg):
                 if reduce_service:
                     try:
                         url = app.previous_picture_url
-                        api_url = reduce_service.format(url=url)  # Modification clé ici
+                        if not url.startswith('http'):
+                            LOGGER.error("URL non valide pour le raccourcissement : %s", url)
+                            return
+
+                        api_url = reduce_service.format(url=url)
                         response = requests.get(api_url)
 
                         if response.status_code == 200:
@@ -102,6 +120,7 @@ def state_processing_exit(app, cfg):
                     LOGGER.error("URL reduction activated but no service URL configured")
         else:
             app.previous_picture_url = None
+
 
 
 class GooglePhotosApi(object):
@@ -122,7 +141,8 @@ class GooglePhotosApi(object):
 
     URL = 'https://photoslibrary.googleapis.com/v1'
     SCOPES = ['https://www.googleapis.com/auth/photoslibrary',
-              'https://www.googleapis.com/auth/photoslibrary.sharing']
+              'https://www.googleapis.com/auth/photoslibrary.sharing',
+              'https://www.googleapis.com/auth/photoslibrary.appendonly']
 
     def __init__(self, client_id_file, token_file="token.json"):
         self.client_id_file = client_id_file
@@ -176,8 +196,12 @@ class GooglePhotosApi(object):
                 credentials.refresh(Request())
                 self._save_credentials(credentials)
 
+
         if credentials:
-            return AuthorizedSession(credentials)
+            session = AuthorizedSession(credentials)
+            session.headers.update({'Content-Type': 'application/json'})
+            return session
+
         return None
 
     def is_reachable(self):
@@ -232,18 +256,9 @@ class GooglePhotosApi(object):
 
         LOGGER.error("Can not create Google Photos album '%s'", album_name)
         return None
-
+        
     def upload(self, filename, album_name):
-        """Upload a photo file to the given Google Photos album.
-
-        :param filename: photo file full path
-        :type filename: str
-        :param album_name: name of albums to upload
-        :type album_name: str
-
-        :returns: uploaded photo ID
-        :rtype: str
-        """
+        """Upload a photo file to the given Google Photos album."""
         photo_id = None
 
         if not self.is_reachable():
@@ -251,7 +266,6 @@ class GooglePhotosApi(object):
             return photo_id
 
         if not self._session:
-            # Plugin was disabled at startup but activated after
             self._session = self._get_authorized_session()
 
         album_id = self.get_album_id(album_name)
@@ -261,63 +275,63 @@ class GooglePhotosApi(object):
             LOGGER.error("Google Photos upload failure: album '%s' not found!", album_name)
             return photo_id
 
-        self._session.headers["Content-type"] = "application/octet-stream"
-        self._session.headers["X-Goog-Upload-Protocol"] = "raw"
-
-        with open(filename, mode='rb') as fp:
-            data = fp.read()
-
-        self._session.headers["X-Goog-Upload-File-Name"] = os.path.basename(filename)
-
-        LOGGER.info("Uploading picture '%s' to Google Photos", filename)
-        upload_resp = self._session.post(self.URL + '/uploads', data)
-
-        if upload_resp.status_code == 200 and upload_resp.content:
-            create_body = json.dumps(
-                {
-                    "albumId": album_id,
-                    "newMediaItems": [
-                        {
-                            "description": "",
-                            "simpleMediaItem": {
-                                "uploadToken": upload_resp.content.decode()
-                            }
-                        }
-                    ]
-                })
-
-            resp = self._session.post(self.URL + '/mediaItems:batchCreate', create_body).json()
-            LOGGER.debug("Google Photos server response: %s", resp)
-
-            if "newMediaItemResults" in resp:
-                status = resp["newMediaItemResults"][0]["status"]
-                if status.get("code") and (status.get("code") > 0):
-                    LOGGER.error("Google Photos upload failure: can not add '%s' to library: %s",
-                                 os.path.basename(filename), status["message"])
-                else:
-                    LOGGER.info("Google Photos upload successful: '%s' added to album '%s'",
-                                os.path.basename(filename), album_name)
-
-                    photo_id = resp["newMediaItemResults"][0]['mediaItem']['id']
-            else:
-                LOGGER.error("Google Photos upload failure: can not add '%s' to library",
-                             os.path.basename(filename))
-
-        elif upload_resp.status_code != 200:
-            LOGGER.error("Google Photos upload failure: can not connect to '%s' (HTTP error %s)",
-                         self.URL, upload_resp.status_code)
-        else:
-            LOGGER.error("Google Photos upload failure: no response content from server '%s'",
-                         self.URL)
+        # Étape 1: Upload du fichier pour obtenir le token
+        upload_url = f'{self.URL}/uploads'
+        headers = {
+            'Content-Type': 'application/octet-stream',
+            'X-Goog-Upload-Protocol': 'raw',
+            'X-Goog-Upload-File-Name': os.path.basename(filename)
+        }
 
         try:
-            del self._session.headers["Content-type"]
-            del self._session.headers["X-Goog-Upload-Protocol"]
-            del self._session.headers["X-Goog-Upload-File-Name"]
-        except KeyError:
-            pass
+            with open(filename, 'rb') as f:
+                upload_resp = self._session.post(upload_url, headers=headers, data=f)
+        except Exception as e:
+            LOGGER.error("Upload failed: %s", str(e))
+            return None
+
+        if upload_resp.status_code != 200 or not upload_resp.content:
+            LOGGER.error("Upload error (HTTP %s): %s", upload_resp.status_code, upload_resp.text)
+            return None
+
+        # Étape 2: Création du média dans l'album
+        create_url = f'{self.URL}/mediaItems:batchCreate'
+        create_body = {
+            "albumId": album_id,
+            "newMediaItems": [{
+                "simpleMediaItem": {
+                    "uploadToken": upload_resp.content.decode(),
+                    "fileName": os.path.basename(filename)
+                }
+            }]
+        }
+
+        try:
+            create_resp = self._session.post(create_url, json=create_body)
+            create_resp.raise_for_status()
+            response_data = create_resp.json()
+        except Exception as e:
+            LOGGER.error("Media creation failed: %s", str(e))
+            return None
+
+        if "newMediaItemResults" in response_data:
+            result = response_data["newMediaItemResults"][0]
+            status = result.get("status", {})
+            
+            # Google renvoie parfois "message" au lieu de "code" pour le succès
+            if status.get("code") == 0 or "Success" in status.get("message", ""):
+                photo_id = result['mediaItem']['id']
+                LOGGER.info(f"Upload réussi : {filename} -> ID {photo_id}")
+                LOGGER.debug("Réponse complète : %s", response_data)  # Debug supplémentaire
+            else:
+                LOGGER.error("Erreur d'upload : Code=%s | Message=%s", 
+                            status.get("code"), 
+                            status.get("message"))
+        else:
+            LOGGER.error("Invalid server response: %s", response_data)
 
         return photo_id
+
 
     def get_temp_url(self, photo_id):
         """
